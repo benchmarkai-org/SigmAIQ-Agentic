@@ -85,7 +85,7 @@ class SigmaLLM(SigmaRuleUpdater):
         except Exception as e:
             raise e
 
-    def create_sigma_vectordb(self, save: bool = True):
+    def create_sigma_vectordb(self, save: bool = True, version: str = None):
         """Creates Sigma rule vector store by performing the following actions:
             1. Load each Sigma rule from the local SigmaHQ Sigma rules repository as Documents
             2. Split each Sigma rule Document
@@ -100,7 +100,7 @@ class SigmaLLM(SigmaRuleUpdater):
 
         """
         if not self.installed_tag:
-            self.update_sigma_rules()
+            self.update_sigma_rules(version=version)
 
         # Load Sigma docs
         sigma_docs = self.create_sigma_rule_docs()
