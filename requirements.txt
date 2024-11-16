@@ -1,4 +1,4 @@
 -r requirements/common.txt
 
-streamlit==1.29.0
+streamlit
 openai==1.40.1
