@@ -2,11 +2,15 @@ import os
 from openai import OpenAI
 from tenacity import retry, wait_exponential, stop_after_attempt
 import time
+import weave
+
+weave.init("sigmaiq-streamlit")
 
 # Load assistant instructions from external file
 INSTRUCTIONS_FILE = os.path.join(os.path.dirname(__file__), "instructions.txt")
 INSTRUCTIONS = open(INSTRUCTIONS_FILE, "r").read()
 
+@weave.op() # 🐝
 def update_assistant(client, assistant_id, new_instructions):
     """
     Updates an OpenAI assistant with new instructions
@@ -28,6 +32,7 @@ def update_assistant(client, assistant_id, new_instructions):
         print(f"Error updating assistant: {str(e)}")
         raise
 
+@weave.op() # 🐝
 def init_client_and_assistant(config):
     """
     Initializes OpenAI client and retrieves/updates the assistant
@@ -45,6 +50,7 @@ def init_client_and_assistant(config):
     )
     return client, assistant
 
+@weave.op() # 🐝
 @retry(wait=wait_exponential(min=1, max=60), stop=stop_after_attempt(5))
 def generate_answer(client, query, assistant):
     """
