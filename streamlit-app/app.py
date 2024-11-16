@@ -2,6 +2,36 @@
 import streamlit as st
 import re
 from llm import init_client_and_assistant, generate_answer
+import hmac
+
+
+
+def check_password():
+    """Returns `True` if the user had the correct password."""
+
+    def password_entered():
+        """Checks whether a password entered by the user is correct."""
+        # Compare the entered password with the stored secret password using a secure comparison
+        if hmac.compare_digest(st.session_state["password"], st.secrets["password"]):
+            # If password is correct, set the session state and remove the password
+            st.session_state["password_correct"] = True
+            del st.session_state["password"]  # Don't store the password for security
+        else:
+            # If password is incorrect, set the session state accordingly
+            st.session_state["password_correct"] = False
+
+    # If password has been previously validated in this session, return True
+    if st.session_state.get("password_correct", False):
+        return True
+
+    # Display password input field if not yet validated
+    st.text_input(
+        "Password", type="password", on_change=password_entered, key="password"
+    )
+    # Show error message if password was incorrect
+    if "password_correct" in st.session_state:
+        st.error("😕 Password incorrect")
+    return False
 
 def load_config():
     """
@@ -49,19 +79,27 @@ def process_answer_sections(text):
                 sections.append(("text", None, part.strip()))
     return sections
 
+
 def run():
     """
     Main application function that sets up the Streamlit UI and handles user interactions.
     
     This function:
-    1. Initializes the OpenAI client and assistant
-    2. Creates the web interface elements
-    3. Handles user input and rule generation
-    4. Displays the generated results
-    5. Manages error cases and user feedback
+    1. Validates user authentication through password checking
+    2. Initializes the OpenAI client and assistant
+    3. Creates the web interface elements
+    4. Handles user input and rule generation
+    5. Displays the generated results
+    6. Manages error cases and user feedback
     
+    The function will stop execution if password validation fails.
     No parameters or return values as it's the main app runner.
     """
+
+    if not check_password():
+        st.stop()  # Halt the app execution
+        return  # Exit the run function
+    
     # Initialize OpenAI client and assistant if not already in session state
     if "client" not in st.session_state:
         config = load_config()
