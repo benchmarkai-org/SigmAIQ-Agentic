@@ -1,13 +1,22 @@
 import json
 import yaml
-from pathlib import Path
-from datetime import datetime
-from typing import List, Dict, Tuple
-from langchain.evaluation import load_evaluator
-from dotenv import load_dotenv
-import os
-import time
 import requests
+import time
+from typing import Dict, List
+import logging
+import urllib3
+import os
+from dotenv import load_dotenv
+from datetime import datetime
+from langchain.evaluation import load_evaluator
+from pathlib import Path
+
+# Suppress SSL warnings
+urllib3.disable_warnings()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 def load_test_cases(test_file: str) -> List[Dict]:
     """
@@ -25,7 +34,92 @@ def load_test_cases(test_file: str) -> List[Dict]:
     with open(test_file, 'r') as f:
         return json.load(f)
 
-def evaluate_rule(generated_rule: str, expected_rule: str) -> Tuple[Dict, float]:
+def generate_rule(query: str, config: Dict) -> str:
+    """
+    Generate a rule by calling the rule generation microservice.
+    """
+    try:
+        base_url = config['RULE_GENERATOR_URL'].rstrip('/')
+        
+        response = requests.post(
+            f"{base_url}/api/v1/rules",
+            json={
+                "query": query,
+                "assistant_id": config['OPENAI_ASSISTANT_ID']
+            },
+            headers={
+                "Authorization": f"Bearer {config['SERVICE_API_KEY']}",
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            },
+            verify=False,  # Disable SSL verification
+            timeout=300
+        )
+        response.raise_for_status()
+        return response.json()["rule"]
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request failed: {str(e)}")
+        raise Exception(f"Failed to generate rule: {str(e)}") 
+
+def get_judge_comparison(rule1: str, rule2: str, config: Dict) -> Dict:
+    """
+    Get a judgment comparison between two rules using the judge endpoint.
+    """
+    try:
+        base_url = config['RULE_GENERATOR_URL'].rstrip('/')
+        
+        response = requests.post(
+            f"{base_url}/api/v1/judge",
+            json={
+                "rule1": rule1,
+                "rule2": rule2,
+                "assistant_id": config['JUDGE_ASSISTANT_ID']
+            },
+            headers={
+                "Authorization": f"Bearer {config['SERVICE_API_KEY']}",
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            },
+            verify=False,
+            timeout=300
+        )
+        response.raise_for_status()
+        return response.json()["judgment"]
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Judge request failed: {str(e)}")
+        raise Exception(f"Failed to get judgment: {str(e)}")
+
+def evaluate_rule(generated_rule: str, expected_rule: str, config: Dict) -> tuple:
+    """
+    Evaluate a generated rule against the expected rule.
+    Combines Langchain-based metrics with LLM judgment.
+    Returns (metrics_dict, overall_score)
+    """
+    try:
+        # Get Langchain-based metrics
+        langchain_metrics = calculate_langchain_metrics(generated_rule, expected_rule)
+        
+        # Get LLM judgment
+        llm_judgment = get_judge_comparison(generated_rule, expected_rule, config)
+        
+        # Combine all metrics into one dictionary
+        combined_metrics = {
+            **langchain_metrics,  # Include all Langchain metrics
+            "llm_judgment": llm_judgment  # Add LLM judgment
+        }
+        
+        # Calculate final score using all metrics
+        overall_score = calculate_combined_score(combined_metrics)
+        
+        return combined_metrics, overall_score
+        
+    except Exception as e:
+        logger.error(f"Evaluation failed: {str(e)}")
+        raise
+
+def calculate_langchain_metrics(generated_rule: str, expected_rule: str) -> dict:
     """
     Evaluate a generated rule against the expected rule using multiple criteria.
     
@@ -72,75 +166,116 @@ def evaluate_rule(generated_rule: str, expected_rule: str) -> Tuple[Dict, float]
         metadata_fields = ["description", "author", "date", "level", "tags"]
         metadata_score = sum(1 for field in metadata_fields if field in generated) / len(metadata_fields)
         metrics["metadata_completeness"] = metadata_score
-        
-        # Calculate overall score (weighted average)
-        weights = {
-            "valid_yaml": 0.2,
-            "has_required_fields": 0.3,
-            "detection_logic_similarity": 0.4,
-            "metadata_completeness": 0.1
-        }
-        overall_score = sum(metrics[k] * weights[k] for k in metrics)
-        
-        return metrics, overall_score
-        
+
+        print(f"Debug - Metrics: {metrics}")
+        return metrics
+    
     except yaml.YAMLError:
         return {"valid_yaml": 0.0, "has_required_fields": 0.0,
                 "detection_logic_similarity": 0.0, "metadata_completeness": 0.0}, 0.0
 
-def generate_rule(query: str, config: Dict) -> str:
+
+def calculate_combined_score(metrics: dict) -> float:
     """
-    Generate a rule by calling the rule generation microservice.
+    Calculate overall score incorporating both Langchain metrics and LLM judgment.
+    Returns a weighted score between 0 and 1.
     """
-    try:
-        # Ensure the URL doesn't end with a slash
-        base_url = config['RULE_GENERATOR_URL'].rstrip('/')
-        
-        response = requests.post(
-            f"{base_url}/generate",
-            json={
-                "query": query,
-                "assistant_id": config['OPENAI_ASSISTANT_ID']
-            },
-            headers={"Authorization": f"Bearer {config['OPENAI_API_KEY']}"}
-        )
-        response.raise_for_status()
-        return response.json()["rule"]
-    except requests.exceptions.RequestException as e:
-        print(f"Request failed: {str(e)}")  # Add debug logging
-        raise Exception(f"Failed to generate rule: {str(e)}")
+    # Weights for different components
+    weights = {
+        "valid_yaml": 0.15,
+        "has_required_fields": 0.20,
+        "detection_logic_similarity": 0.25,
+        "metadata_completeness": 0.10,
+        "llm_judgment": 0.30
+    }
+    
+    # Create a copy of metrics to avoid modifying the original
+    metrics_for_calculation = metrics.copy()
+    
+    # Extract numerical score from llm_judgment if it exists
+    if "llm_judgment" in metrics:
+        try:
+            # First try to parse the JSON string
+            if isinstance(metrics["llm_judgment"], str):
+                judgment_dict = json.loads(metrics["llm_judgment"])
+                if isinstance(judgment_dict, dict):
+                    llm_score = float(judgment_dict.get("score", 0.5))
+                else:
+                    # Handle legacy string case
+                    score_mapping = {
+                        "excellent": 1.0,
+                        "good": 0.75,
+                        "fair": 0.5,
+                        "poor": 0.25,
+                        "bad": 0.0
+                    }
+                    llm_score = score_mapping.get(metrics["llm_judgment"].lower(), 0.5)
+            else:
+                llm_score = float(metrics["llm_judgment"])
+            
+            metrics_for_calculation["llm_judgment"] = llm_score
+        except (ValueError, AttributeError, TypeError, json.JSONDecodeError) as e:
+            # If there's any error parsing the score, use a default value
+            logger.warning(f"Could not parse LLM judgment score: {e}. Using default value of 0.5")
+            metrics_for_calculation["llm_judgment"] = 0.5
+    
+    # Calculate weighted sum of all metrics
+    overall_score = sum(
+        metrics_for_calculation[k] * weights[k] 
+        for k in weights 
+        if k in metrics_for_calculation
+    )
+    
+    # Normalize to ensure score is between 0 and 1
+    return min(max(overall_score, 0.0), 1.0)
 
 def run_evaluation(config: Dict, test_cases: List[Dict]) -> List[Dict]:
     """
     Run evaluation on all test cases and return results.
     """
-    results = []
+    # Validate required config
+    required_config = ['RULE_GENERATOR_URL', 'SERVICE_API_KEY', 
+                      'OPENAI_ASSISTANT_ID', 'JUDGE_ASSISTANT_ID']
+    if not all(key in config for key in required_config):
+        raise ValueError(f"Missing required configuration. Need: {required_config}")
     
-    for case in test_cases:
+    results = []
+    total_cases = len(test_cases)
+    
+    logger.info(f"Starting evaluation of {total_cases} test cases...")
+    
+    for idx, case in enumerate(test_cases, 1):
         try:
-            # Generate rule using microservice
+            logger.info(f"Processing case {idx}/{total_cases}: {case['query'][:50]}...")
+            
             yaml_block = generate_rule(case["query"], config)
             
-            # Evaluate the generated rule
-            metrics, score = evaluate_rule(yaml_block, case["expected_rule"])
+            # Evaluate using both Langchain metrics and LLM judgment
+            metrics, score = evaluate_rule(yaml_block, case["expected_rule"], config)
             
             results.append({
                 "query": case["query"],
                 "generated_rule": yaml_block,
                 "expected_rule": case["expected_rule"],
                 "metrics": metrics,
-                "overall_score": score
+                "overall_score": score,
+                "llm_judgment_text": metrics["llm_judgment"]  # Extract from metrics
             })
             
+            logger.info(f"Completed case {idx}/{total_cases} with score: {score:.2f}")
+            
         except Exception as e:
+            logger.error(f"Failed case {idx}/{total_cases}: {str(e)}")
             results.append({
                 "query": case["query"],
                 "error": str(e),
                 "metrics": None,
-                "overall_score": 0.0
+                "overall_score": 0.0,
+                "llm_judgment_text": None
             })
     
-    return results
+    logger.info(f"Evaluation complete. Processed {total_cases} cases.")
+    return results 
 
 def save_results(results: List[Dict], output_dir: str):
     """
@@ -165,7 +300,9 @@ def main():
     config = {
         "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),
         "OPENAI_ASSISTANT_ID": os.getenv("OPENAI_ASSISTANT_ID"),
-        "RULE_GENERATOR_URL": os.getenv("RULE_GENERATOR_URL", "http://127.0.0.1:5001")
+        "RULE_GENERATOR_URL": os.getenv("RULE_GENERATOR_URL", "http://127.0.0.1:5001"),
+        "JUDGE_ASSISTANT_ID": os.getenv("JUDGE_ASSISTANT_ID"),
+        "SERVICE_API_KEY": os.getenv("SERVICE_API_KEY")
     }
     
     # Debug print
