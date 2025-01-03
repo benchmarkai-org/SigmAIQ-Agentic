@@ -166,6 +166,10 @@ cython_debug/
 
 # Custom data folder for vectordb and sigma rules
 sigmaiq/llm/data/*
+.DS_Store
+
+*.pem
+*.toml
 
 # test file
 test.py
