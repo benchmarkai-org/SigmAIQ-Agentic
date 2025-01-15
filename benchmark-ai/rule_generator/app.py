@@ -4,12 +4,12 @@ import time
 import os
 from dotenv import load_dotenv
 from functools import wraps
-import secrets
 import logging
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_cors import CORS
 from secrets import compare_digest
+from pathlib import Path
 
 app = Flask(__name__)
 # Configure CORS with strict settings
@@ -56,83 +56,58 @@ def require_api_key(f):
         return f(*args, **kwargs)
     return decorated
 
-def generate_rule_with_assistant(client: OpenAI, assistant_id: str, query: str) -> str:
+def wait_for_assistant_completion(client: OpenAI, thread_id: str, run_id: str) -> None:
     """
-    Generate a rule using OpenAI assistant.
+    Wait for an assistant run to complete.
     """
-    thread = client.beta.threads.create()
-    message = client.beta.threads.messages.create(
-        thread_id=thread.id,
-        role="user",
-        content=query
-    )
-    run = client.beta.threads.runs.create(
-        thread_id=thread.id,
-        assistant_id=assistant_id
-    )
-    
-    # Wait for completion
     while True:
         run_status = client.beta.threads.runs.retrieve(
-            thread_id=thread.id,
-            run_id=run.id
+            thread_id=thread_id,
+            run_id=run_id
         )
         if run_status.status == 'completed':
             break
         time.sleep(1)
-    
-    # Get response
-    messages = client.beta.threads.messages.list(thread_id=thread.id)
-    response = messages.data[0].content[0].text.value
-    
-    # Extract the YAML block from the response
-    yaml_block = response.split("```yaml")[1].split("```")[0].strip()
-    return yaml_block
 
-def judge_rules_with_assistant(client: OpenAI, assistant_id: str, rule1: str, rule2: str) -> dict:
+def get_assistant_response(client: OpenAI, assistant_id: str, prompt: str) -> str:
     """
-    Compare two rules using OpenAI assistant and return a judgment.
+    Get a response from an OpenAI assistant.
     """
-    # Construct the comparison query
-    comparison_data = {
-        "rule1": rule1,
-        "rule2": rule2
-    }
-    
     thread = client.beta.threads.create()
-    message = client.beta.threads.messages.create(
+    
+    # Send message
+    client.beta.threads.messages.create(
         thread_id=thread.id,
         role="user",
-        content=f"{comparison_data}"
+        content=prompt
     )
     
+    # Create and wait for run
     run = client.beta.threads.runs.create(
         thread_id=thread.id,
         assistant_id=assistant_id
     )
     
-    # Wait for completion
-    while True:
-        run_status = client.beta.threads.runs.retrieve(
-            thread_id=thread.id,
-            run_id=run.id
-        )
-        if run_status.status == 'completed':
-            break
-        time.sleep(1)
+    wait_for_assistant_completion(client, thread.id, run.id)
     
     # Get response
     messages = client.beta.threads.messages.list(thread_id=thread.id)
-    response = messages.data[0].content[0].text.value
-    
-    return {"judgment": response}
+    return messages.data[0].content[0].text.value
+
+def create_openai_client() -> OpenAI:
+    """
+    Create an OpenAI client with standard configuration.
+    """
+    return OpenAI(
+        api_key=OPENAI_API_KEY,
+        base_url="https://api.openai.com/v1"
+    )
 
 @app.route('/api/v1/rules', methods=['POST'])
-@limiter.limit("10 per minute")  # Rate limiting per endpoint
+@limiter.limit("10 per minute")
 @require_api_key
 def create_rule():
     try:
-        # Input validation
         data = request.get_json()
         if not data:
             logger.error("No JSON data in request")
@@ -143,23 +118,18 @@ def create_rule():
             logger.error(f"Missing required fields: {required_fields}")
             return jsonify({'error': 'Missing required fields'}), 400
             
-        # Validate query length
-        if len(data['query']) > 1000:  # Adjust limit as needed
+        if len(data['query']) > 1000:
             return jsonify({'error': 'Query too long'}), 400
             
-        # Initialize OpenAI client with only the required parameters
-        client = OpenAI(
-            api_key=OPENAI_API_KEY,
-            base_url="https://api.openai.com/v1"  # Explicitly set base URL
-        )
+        client = create_openai_client()
+        response = get_assistant_response(client, data['assistant_id'], data['query'])
         
-        rule = generate_rule_with_assistant(client, data['assistant_id'], data['query'])
-        
-        # Sanitize/validate response before returning
-        if not rule or len(rule) > 10000:  # Adjust limit as needed
+        # Extract YAML block
+        yaml_block = response.split("```yaml")[1].split("```")[0].strip()
+        if not yaml_block or len(yaml_block) > 10000:
             raise ValueError("Invalid rule generated")
             
-        return jsonify({'rule': rule})
+        return jsonify({'rule': yaml_block})
         
     except Exception as e:
         logger.error(f"Error processing request: {str(e)}", exc_info=True)
@@ -170,7 +140,6 @@ def create_rule():
 @require_api_key
 def judge_rules():
     try:
-        # Input validation
         data = request.get_json()
         if not data:
             logger.error("No JSON data in request")
@@ -181,23 +150,76 @@ def judge_rules():
             logger.error(f"Missing required fields: {required_fields}")
             return jsonify({'error': 'Missing required fields'}), 400
             
-        # Validate rules length
-        if len(data['rule1']) > 5000 or len(data['rule2']) > 5000:  # Adjust limit as needed
+        if len(data['rule1']) > 5000 or len(data['rule2']) > 5000:
             return jsonify({'error': 'Rules too long'}), 400
             
-        client = OpenAI(
-            api_key=OPENAI_API_KEY,
-            base_url="https://api.openai.com/v1"
+        client = create_openai_client()
+        judgment = get_assistant_response(
+            client,
+            data['assistant_id'],
+            f"Compare these rules:\nRule 1:\n{data['rule1']}\nRule 2:\n{data['rule2']}"
         )
         
-        judgment = judge_rules_with_assistant(
-            client, 
-            data['assistant_id'], 
-            data['rule1'], 
-            data['rule2']
+        return jsonify({"judgment": judgment})
+        
+    except Exception as e:
+        logger.error(f"Error processing request: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/api/v1/assess', methods=['POST'])
+@limiter.limit("10 per minute")
+@require_api_key
+def assess_rule():
+    try:
+        data = request.get_json()
+        if not data:
+            logger.error("No JSON data in request")
+            return jsonify({'error': 'Missing request body'}), 400
+            
+        required_fields = ['rule', 'assistant_id']
+        if not all(field in data for field in required_fields):
+            logger.error(f"Missing required fields: {required_fields}")
+            return jsonify({'error': 'Missing required fields'}), 400
+            
+        if len(data['rule']) > 5000:
+            return jsonify({'error': 'Rule too long'}), 400
+            
+        client = create_openai_client()
+        assessment = get_assistant_response(
+            client,
+            data['assistant_id'],
+            f"Please assess this Sigma rule:\n{data['rule']}"
         )
         
-        return jsonify(judgment)
+        return jsonify({"assessment": assessment})
+        
+    except Exception as e:
+        logger.error(f"Error processing request: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/api/v1/summarize-references', methods=['POST'])
+@limiter.limit("5 per minute")
+@require_api_key
+def summarize_references():
+    try:
+        data = request.get_json()
+        if not data:
+            logger.error("No JSON data in request")
+            return jsonify({'error': 'Missing request body'}), 400
+            
+        required_fields = ['reference_content', 'assistant_id']
+        if not all(field in data for field in required_fields):
+            logger.error(f"Missing required fields: {required_fields}")
+            return jsonify({'error': 'Missing required fields'}), 400
+            
+        client = create_openai_client()
+        summary = get_assistant_response(
+            client,
+            data['assistant_id'],
+            f"Please summarize this reference content:\n\n{data['reference_content']}"
+        )
+        
+        return jsonify({'summary': summary})
         
     except Exception as e:
         logger.error(f"Error processing request: {str(e)}", exc_info=True)
